@@ -257,21 +257,13 @@
     <div class="field">
       <label for="symbol">Symbol</label>
       <select id="symbol">
-        <option>NIFTY 50</option>
-        <option>BANKNIFTY</option>
-        <option>FINNIFTY</option>
-        <option>SENSEX</option>
-        <option>RELIANCE</option>
-        <option>SBIN</option>
+        <option>Loading…</option>
       </select>
     </div>
     <div class="field">
       <label for="expiry">Expiry</label>
       <select id="expiry">
-        <option>14 Aug 2026 (Weekly)</option>
-        <option>21 Aug 2026 (Weekly)</option>
-        <option>28 Aug 2026 (Monthly)</option>
-        <option>25 Sep 2026 (Monthly)</option>
+        <option>Loading…</option>
       </select>
     </div>
     <div class="spacer"></div>
@@ -395,13 +387,141 @@
   var STRIKES = 12;
   var maxOI = 0;
 
-  function rnd(min,max){ return Math.random()*(max-min)+min; }
-  function seedRandom(seed){
-    var s = seed;
-    return function(){
-      s = (s * 9301 + 49297) % 233280;
-      return s / 233280;
-    };
+  // ---- Symbol Master API ----
+  var SYMBOL_MASTER_API = 'http://103.240.91.122/api/SymbolMaster';
+  // ---- Expiry Dates API ----
+  var EXPIRY_API_BASE = 'http://103.240.91.122/api/derivatives/expiryDates';
+  // ---- Call/Put Option-Chain API ----
+  var CALL_PUT_API_BASE = 'http://103.240.91.122/api/Index/call-put';
+
+  // The Symbol dropdown is populated from SymbolMaster's NSE_SYMBOL field,
+  // and that same value is exactly what the expiryDates ("index") and
+  // call-put ("category") APIs expect — so no separate mapping is needed.
+  function symbolToIndexParam(symbol){
+    return symbol;
+  }
+
+  function fetchSymbolMaster(){
+    return fetch(SYMBOL_MASTER_API)
+      .then(function(res){
+        if(!res.ok) throw new Error('SymbolMaster API HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function(list){
+        return (list || [])
+          .map(function(s){ return s.NSE_SYMBOL || s.NSE_Symbol || s.nse_symbol; })
+          .filter(Boolean);
+      });
+  }
+
+  function populateSymbolOptions(symbols){
+    var symbolSelect = document.getElementById('symbol');
+    symbolSelect.innerHTML = '';
+    if(!symbols.length){
+      var opt = document.createElement('option');
+      opt.textContent = 'No symbols available';
+      symbolSelect.appendChild(opt);
+      return;
+    }
+    symbols.forEach(function(sym){
+      var opt = document.createElement('option');
+      opt.value = sym;
+      opt.textContent = sym;
+      symbolSelect.appendChild(opt);
+    });
+  }
+
+  function loadSymbolMaster(){
+    var symbolSelect = document.getElementById('symbol');
+    symbolSelect.innerHTML = '<option>Loading…</option>';
+    fetchSymbolMaster()
+      .then(function(symbols){
+        populateSymbolOptions(symbols);
+        loadExpiriesForSymbol(symbolSelect.value);
+      })
+      .catch(function(err){
+        console.warn('SymbolMaster API unavailable, keeping manual fallback list:', err);
+        populateSymbolOptions(['Nifty', 'BankNifty']);
+        loadExpiriesForSymbol(symbolSelect.value);
+      });
+  }
+
+  // API returns e.g. {"data":{"expdt":[{"date":"15-Sep-2026","type":"W",...}, ...]}}
+  // type "W" = Weekly, "M" = Monthly. Keep the raw "date" as the option value
+  // (it's exactly what the call-put API expects for its "expiry" param) and
+  // show a friendlier "15 Sep 2026 (Weekly)" label.
+  function formatExpiryEntry(entry){
+    var label = entry.date.replace(/-/g, ' ');
+    var typeLabel = entry.type === 'M' ? 'Monthly' : (entry.type === 'W' ? 'Weekly' : entry.type);
+    return { value: entry.date, label: label + ' (' + typeLabel + ')' };
+  }
+
+  function fetchExpiryDates(symbol){
+    var indexParam = symbolToIndexParam(symbol);
+    var url = EXPIRY_API_BASE + '?index=' + encodeURIComponent(indexParam);
+    return fetch(url)
+      .then(function(res){
+        if(!res.ok) throw new Error('Expiry API HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function(json){
+        var list = (json && json.data && json.data.expdt) || [];
+        return list.map(formatExpiryEntry);
+      });
+  }
+
+  function populateExpiryOptions(entries){
+    var expirySelect = document.getElementById('expiry');
+    expirySelect.innerHTML = '';
+    if(!entries.length){
+      var opt = document.createElement('option');
+      opt.textContent = 'No expiries available';
+      expirySelect.appendChild(opt);
+      return;
+    }
+    entries.forEach(function(entry){
+      var opt = document.createElement('option');
+      opt.value = entry.value;
+      opt.textContent = entry.label;
+      expirySelect.appendChild(opt);
+    });
+  }
+
+  function updateHeadlineTitle(){
+    document.querySelector('.chain-headline .title').textContent =
+      document.getElementById('symbol').value + ' — ' +
+      document.getElementById('expiry').selectedOptions[0].textContent.split(' (')[0] + ' expiry';
+  }
+
+  function loadExpiriesForSymbol(symbol){
+    var expirySelect = document.getElementById('expiry');
+    expirySelect.innerHTML = '<option>Loading…</option>';
+    fetchExpiryDates(symbol)
+      .then(function(entries){
+        populateExpiryOptions(entries);
+        updateHeadlineTitle();
+        loadOptionChainForCurrentSelection();
+      })
+      .catch(function(err){
+        console.warn('Expiry API unavailable, keeping manual fallback list:', err);
+        populateExpiryOptions([
+          { value:'15-Sep-2026', label:'15 Sep 2026 (Weekly)' },
+          { value:'22-Sep-2026', label:'22 Sep 2026 (Weekly)' },
+          { value:'29-Sep-2026', label:'29 Sep 2026 (Monthly)' }
+        ]);
+        updateHeadlineTitle();
+        loadOptionChainForCurrentSelection();
+      });
+  }
+
+  // ---- Call/Put option-chain fetch + parsing ----
+  var liveRows = null;      // real per-strike rows from the API, or null to fall back to simulated data
+  var liveTotals = null;    // the API's aggregated "Total" row, or null
+
+  function parseNum(v){
+    if(v === null || v === undefined || v === '') return null;
+    var n = parseFloat(String(v).replace(/,/g, '').replace('%', '').trim());
+    return isNaN(n) ? null : n;
   }
 
   function buildupTag(oiChange, priceChange){
@@ -409,6 +529,118 @@
     if(oiChange >= 0 && priceChange < 0) return {cls:'short-b', label:'Short buildup'};
     if(oiChange < 0 && priceChange >= 0) return {cls:'short-u', label:'Short covering'};
     return {cls:'long-u', label:'Long unwind'};
+  }
+
+  // Converts the raw API "data" array into the row shape render() consumes,
+  // and separately returns the "Total" summary row.
+  function transformApiRows(apiRows){
+    var strikeRows = apiRows.filter(function(d){ return d.strike && d.strike.value !== 'Total'; });
+    var totalRow = apiRows.filter(function(d){ return d.strike && d.strike.value === 'Total'; })[0] || null;
+
+    var atmStrike = null;
+    strikeRows.forEach(function(d){
+      var c = d.OptionsData.call, p = d.OptionsData.put;
+      if((c && c.isSpotRow) || (p && p.isSpotRow)) atmStrike = parseNum(d.strike.value);
+    });
+
+    maxOI = 0;
+    var rows = strikeRows.map(function(d){
+      var strike = parseNum(d.strike.value);
+      var c = d.OptionsData.call || {};
+      var p = d.OptionsData.put || {};
+      var callOI = parseNum(c.oi_lakh && c.oi_lakh.value) || 0;
+      var putOI  = parseNum(p.oi_lakh && p.oi_lakh.value) || 0;
+      var callChgOI = parseNum(c.oi_chg && c.oi_chg.value) || 0;
+      var putChgOI  = parseNum(p.oi_chg && p.oi_chg.value) || 0;
+      var callPriceChg = parseNum(c.ltp_Perchg && c.ltp_Perchg.value) || 0;
+      var putPriceChg  = parseNum(p.ltp_Perchg && p.ltp_Perchg.value) || 0;
+
+      maxOI = Math.max(maxOI, callOI, putOI);
+
+      return {
+        strike: strike,
+        isATM: atmStrike !== null && strike === atmStrike,
+        callITM: atmStrike !== null && strike < atmStrike,
+        putITM: atmStrike !== null && strike > atmStrike,
+        callOI: callOI, putOI: putOI,
+        callChgOI: callChgOI, putChgOI: putChgOI,
+        callIV: c.iV != null ? c.iV : '—',
+        putIV: p.iV != null ? p.iV : '—',
+        callLTP: (c.ltp && c.ltp.value) || '—',
+        putLTP: (p.ltp && p.ltp.value) || '—',
+        callVol: null, putVol: null, // this API doesn't expose per-strike volume
+        callBuild: buildupTag(callChgOI, callPriceChg),
+        putBuild: buildupTag(putChgOI, putPriceChg)
+      };
+    });
+
+    return { rows: rows, totalRow: totalRow };
+  }
+
+  // The API's "Total" row already reports oi_lakh in **lakh** units for the
+  // combined total (e.g. "711.84" = 711.84 lakh contracts = 7.12 Cr).
+  function updateSummaryFromTotals(totalRow){
+    if(!totalRow) return;
+    var callLakh = parseNum(totalRow.OptionsData.call.oi_lakh.value) || 0;
+    var putLakh  = parseNum(totalRow.OptionsData.put.oi_lakh.value) || 0;
+    var callCr = callLakh / 100;
+    var putCr  = putLakh / 100;
+    var totalCr = callCr + putCr;
+    var callPct = totalCr ? (callCr/totalCr*100) : 50;
+    var putPct  = totalCr ? (putCr/totalCr*100) : 50;
+    var pcr = callCr ? (putCr/callCr) : 0;
+
+    var totalContracts = Math.round((callLakh + putLakh) * 100000);
+    document.getElementById('totalOI').textContent = totalContracts.toLocaleString('en-IN');
+    document.getElementById('oiCallCr').textContent = callCr.toFixed(2) + ' Cr';
+    document.getElementById('oiPutCr').textContent = putCr.toFixed(2) + ' Cr';
+    document.getElementById('oiPCR').textContent = pcr.toFixed(2);
+    var bar = document.querySelector('#totalOI').closest('.summary-card').querySelector('.summary-bar');
+    bar.querySelector('.seg-call').style.width = callPct + '%';
+    bar.querySelector('.seg-put').style.width = putPct + '%';
+  }
+
+  function fetchOptionChain(symbol, expiryRaw){
+    var category = symbolToIndexParam(symbol);
+    var url = CALL_PUT_API_BASE + '?category=' + encodeURIComponent(category) + '&expiry=' + encodeURIComponent(expiryRaw);
+    return fetch(url)
+      .then(function(res){
+        if(!res.ok) throw new Error('Call-put API HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function(json){
+        return transformApiRows((json && json.data) || []);
+      });
+  }
+
+  function loadOptionChainForCurrentSelection(){
+    var symbol = document.getElementById('symbol').value;
+    var expirySelect = document.getElementById('expiry');
+    var expiryRaw = expirySelect.value;
+    if(!expiryRaw || expirySelect.options.length === 0) return;
+
+    fetchOptionChain(symbol, expiryRaw)
+      .then(function(result){
+        liveRows = result.rows;
+        liveTotals = result.totalRow;
+        updateSummaryFromTotals(liveTotals);
+        render();
+      })
+      .catch(function(err){
+        console.warn('Call-put API unavailable, showing simulated chain instead:', err);
+        liveRows = null;
+        liveTotals = null;
+        render();
+      });
+  }
+
+  function rnd(min,max){ return Math.random()*(max-min)+min; }
+  function seedRandom(seed){
+    var s = seed;
+    return function(){
+      s = (s * 9301 + 49297) % 233280;
+      return s / 233280;
+    };
   }
 
   function generateRows(){
@@ -461,7 +693,7 @@
   function fmt(n){ return Number(n).toLocaleString('en-IN'); }
 
   function render(){
-    var rows = generateRows();
+    var rows = liveRows || generateRows();
     var body = document.getElementById('chainBody');
     body.innerHTML = '';
     rows.forEach(function(r){
@@ -474,7 +706,7 @@
       tr.innerHTML =
         '<td>' + '<span class="buildup ' + r.callBuild.cls + '">' + r.callBuild.label + '</span>' + '</td>' +
         '<td class="' + (r.callITM?'itm-c':'') + '">' + r.callIV + '%</td>' +
-        '<td class="' + (r.callITM?'itm-c':'') + '">' + fmt(r.callVol) + '</td>' +
+        '<td class="' + (r.callITM?'itm-c':'') + '">' + (r.callVol==null?'—':fmt(r.callVol)) + '</td>' +
         '<td class="' + (r.callChgOI>=0?'pos':'neg') + ' ' + (r.callITM?'itm-c':'') + '">' + (r.callChgOI>=0?'+':'') + fmt(r.callChgOI) + '</td>' +
         '<td class="oi-bar ' + (r.callITM?'itm-c':'') + '"><span class="bar c" style="width:' + callOIWidth + '%"></span><span>' + fmt(r.callOI) + '</span></td>' +
         '<td class="' + (r.callITM?'itm-c':'') + '" style="font-weight:600;">' + r.callLTP + '</td>' +
@@ -482,7 +714,7 @@
         '<td class="' + (r.putITM?'itm-p':'') + '" style="font-weight:600;">' + r.putLTP + '</td>' +
         '<td class="oi-bar ' + (r.putITM?'itm-p':'') + '"><span class="bar p" style="width:' + putOIWidth + '%"></span><span>' + fmt(r.putOI) + '</span></td>' +
         '<td class="' + (r.putChgOI>=0?'pos':'neg') + ' ' + (r.putITM?'itm-p':'') + '">' + (r.putChgOI>=0?'+':'') + fmt(r.putChgOI) + '</td>' +
-        '<td class="' + (r.putITM?'itm-p':'') + '">' + fmt(r.putVol) + '</td>' +
+        '<td class="' + (r.putITM?'itm-p':'') + '">' + (r.putVol==null?'—':fmt(r.putVol)) + '</td>' +
         '<td class="' + (r.putITM?'itm-p':'') + '">' + r.putIV + '%</td>' +
         '<td>' + '<span class="buildup ' + r.putBuild.cls + '">' + r.putBuild.label + '</span>' + '</td>';
       body.appendChild(tr);
@@ -529,17 +761,18 @@
     });
   });
 
-  // ---- symbol / expiry re-render (cosmetic reseed) ----
+  // ---- symbol change: refetch expiries for the new symbol ----
   document.getElementById('symbol').addEventListener('change', function(e){
-    document.querySelector('.chain-headline .title').textContent =
-      e.target.value + ' — ' + document.getElementById('expiry').value.split(' (')[0] + ' expiry';
-    render();
+    loadExpiriesForSymbol(e.target.value);
   });
-  document.getElementById('expiry').addEventListener('change', function(e){
-    document.querySelector('.chain-headline .title').textContent =
-      document.getElementById('symbol').value + ' — ' + e.target.value.split(' (')[0] + ' expiry';
-    render();
+  // ---- expiry change: refetch the option chain for the newly chosen expiry ----
+  document.getElementById('expiry').addEventListener('change', function(){
+    updateHeadlineTitle();
+    loadOptionChainForCurrentSelection();
   });
+
+  // ---- initial load: fetch symbols, then expiries, then the option chain ----
+  loadSymbolMaster();
 })();
 </script>
 </body>
